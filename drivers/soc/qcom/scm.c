@@ -11,6 +11,7 @@
 #include <linux/err.h>
 #include <linux/init.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 
 #include <asm/cacheflush.h>
 #include <asm/compiler.h>
@@ -27,6 +28,9 @@
 #define SCM_ERROR		-1
 #define SCM_INTERRUPTED		1
 #define SCM_V2_EBUSY		-12
+#define SCM_V2_TIMED_OUT	-13
+#define SCM_INTERRUPTED_TIMEOUT_MS	2000
+#define SCM_INTERRUPTED_MAX_RETRIES	1000000
 
 static DEFINE_MUTEX(scm_lock);
 
@@ -88,8 +92,42 @@ static int scm_remap_error(int err)
 		return -ENOMEM;
 	case SCM_V2_EBUSY:
 		return -EBUSY;
+	case SCM_V2_TIMED_OUT:
+		return -ETIMEDOUT;
 	}
 	return -EINVAL;
+}
+
+/*
+ * apollon: SCM_INTERRUPTED means "the secure world is busy, send the SMC
+ * again".  A few retries is normal; an endless stream of them means QTEE is
+ * wedged.  These loops run while the caller holds the SCM and qseecom locks,
+ * so spinning in them wedges every other TEE client as well: the gatekeeper
+ * HAL never returns, its ioctl cannot be killed (no signal check), and only a
+ * reboot clears it - the apollon decrypt stall, see docs/DECRYPT-STALL.md in
+ * the device tree.  Bound the retries and fail loudly so callers get an error
+ * instead of hanging forever.
+ *
+ * No sleeping here: these wrappers are also reached from atomic context
+ * (scm_call2_atomic -> arch/arm64/mm/fault.c).  The retry-count backstop covers
+ * the case where jiffies cannot advance (interrupts off).
+ */
+struct scm_interrupted_watch {
+	unsigned long start;
+	unsigned int retries;
+};
+
+static bool scm_interrupted_give_up(struct scm_interrupted_watch *w)
+{
+	w->retries++;
+	if (w->retries <= SCM_INTERRUPTED_MAX_RETRIES &&
+	    !time_after(jiffies,
+			w->start + msecs_to_jiffies(SCM_INTERRUPTED_TIMEOUT_MS)))
+		return false;
+
+	pr_err("scm: secure world returned INTERRUPTED %u times (%d ms), giving up\n",
+	       w->retries, SCM_INTERRUPTED_TIMEOUT_MS);
+	return true;
 }
 
 #ifdef CONFIG_ARM64
@@ -104,6 +142,7 @@ static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
 	register u64 r4 asm("x4") = x4;
 	register u64 r5 asm("x5") = x5;
 	register u64 r6 asm("x6") = 0;
+	struct scm_interrupted_watch watch = { jiffies, 0 };
 
 	do {
 		asm volatile(
@@ -131,6 +170,8 @@ static int __scm_call_armv8_64(u64 x0, u64 x1, u64 x2, u64 x3, u64 x4, u64 x5,
 			  "r" (r5), "r" (r6)
 			: "x7", "x8", "x9", "x10", "x11", "x12", "x13",
 			  "x14", "x15", "x16", "x17");
+		if (r0 == SCM_INTERRUPTED && scm_interrupted_give_up(&watch))
+			return SCM_V2_TIMED_OUT;
 	} while (r0 == SCM_INTERRUPTED);
 
 	if (ret1)
@@ -153,6 +194,7 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 	register u32 r4 asm("w4") = w4;
 	register u32 r5 asm("w5") = w5;
 	register u32 r6 asm("w6") = 0;
+	struct scm_interrupted_watch watch = { jiffies, 0 };
 
 	do {
 		asm volatile(
@@ -180,6 +222,8 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 			  "r" (r5), "r" (r6)
 			: "x7", "x8", "x9", "x10", "x11", "x12", "x13",
 			"x14", "x15", "x16", "x17");
+		if (r0 == SCM_INTERRUPTED && scm_interrupted_give_up(&watch))
+			return SCM_V2_TIMED_OUT;
 
 	} while (r0 == SCM_INTERRUPTED);
 
@@ -205,6 +249,7 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 	register u32 r4 asm("r4") = w4;
 	register u32 r5 asm("r5") = w5;
 	register u32 r6 asm("r6") = 0;
+	struct scm_interrupted_watch watch = { jiffies, 0 };
 
 	do {
 		asm volatile(
@@ -230,6 +275,8 @@ static int __scm_call_armv8_32(u32 w0, u32 w1, u32 w2, u32 w3, u32 w4, u32 w5,
 			  "=r" (r4), "=r" (r5), "=r" (r6)
 			: "r" (r0), "r" (r1), "r" (r2), "r" (r3), "r" (r4),
 			 "r" (r5), "r" (r6));
+		if (r0 == SCM_INTERRUPTED && scm_interrupted_give_up(&watch))
+			return SCM_V2_TIMED_OUT;
 
 	} while (r0 == SCM_INTERRUPTED);
 
